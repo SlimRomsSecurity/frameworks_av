@@ -25,10 +25,8 @@
 #include <media/stagefright/MediaDefs.h>
 #include <media/stagefright/MediaErrors.h>
 #include <media/stagefright/MetaData.h>
-#include <media/hardware/HardwareAPI.h>
 #include <camera/Camera.h>
 #include <camera/CameraParameters.h>
-#include <camera/ICameraRecordingProxy.h>
 #include <gui/Surface.h>
 #include <utils/String8.h>
 #include <cutils/properties.h>
@@ -124,6 +122,12 @@ static int32_t getColorFormat(const char* colorFormat) {
     if (!strcmp(colorFormat, "OMX_TI_COLOR_FormatYUV420PackedSemiPlanar")) {
        return OMX_TI_COLOR_FormatYUV420PackedSemiPlanar;
     }
+
+#ifdef STE_HARDWARE
+    if (!strcmp(colorFormat, CameraParameters::PIXEL_FORMAT_YUV420MB)) {
+       return OMX_STE_COLOR_FormatYUV420PackedSemiPlanarMB;
+    }
+#endif
 
     if (!strcmp(colorFormat, CameraParameters::PIXEL_FORMAT_ANDROID_OPAQUE)) {
         return OMX_COLOR_FormatAndroidOpaque;
@@ -573,13 +577,22 @@ status_t CameraSource::initWithCameraAccess(
 
     // XXX: query camera for the stride and slice height
     // when the capability becomes available.
+#ifdef STE_HARDWARE
+    int stride = newCameraParams.getInt(CameraParameters::KEY_RECORD_STRIDE);
+    int sliceHeight = newCameraParams.getInt(CameraParameters::KEY_RECORD_SLICE_HEIGHT);
+#endif
     mMeta = new MetaData;
     mMeta->setCString(kKeyMIMEType,  MEDIA_MIMETYPE_VIDEO_RAW);
     mMeta->setInt32(kKeyColorFormat, mColorFormat);
     mMeta->setInt32(kKeyWidth,       mVideoSize.width);
     mMeta->setInt32(kKeyHeight,      mVideoSize.height);
+#ifdef STE_HARDWARE
+    mMeta->setInt32(kKeyStride,      stride != -1 ? stride : mVideoSize.width);
+    mMeta->setInt32(kKeySliceHeight, sliceHeight != -1 ? sliceHeight : mVideoSize.height);
+#else
     mMeta->setInt32(kKeyStride,      mVideoSize.width);
     mMeta->setInt32(kKeySliceHeight, mVideoSize.height);
+#endif
     mMeta->setInt32(kKeyFrameRate,   mVideoFrameRate);
 
 #ifdef QCOM_HARDWARE
@@ -754,8 +767,6 @@ void CameraSource::releaseQueuedFrames() {
     List<sp<IMemory> >::iterator it;
     while (!mFramesReceived.empty()) {
         it = mFramesReceived.begin();
-        // b/28466701
-        adjustOutgoingANWBuffer(it->get());
         releaseRecordingFrame(*it);
         mFramesReceived.erase(it);
         ++mNumFramesDropped;
@@ -776,9 +787,6 @@ void CameraSource::signalBufferReturned(MediaBuffer *buffer) {
     for (List<sp<IMemory> >::iterator it = mFramesBeingEncoded.begin();
          it != mFramesBeingEncoded.end(); ++it) {
         if ((*it)->pointer() ==  buffer->data()) {
-            // b/28466701
-            adjustOutgoingANWBuffer(it->get());
-
             releaseOneRecordingFrame((*it));
             mFramesBeingEncoded.erase(it);
             ++mNumFramesEncoded;
@@ -883,10 +891,6 @@ void CameraSource::dataCallbackTimestamp(int64_t timestampUs,
     ++mNumFramesReceived;
 
     CHECK(data != NULL && data->size() > 0);
-
-    // b/28466701
-    adjustIncomingANWBuffer(data.get());
-
     mFramesReceived.push_back(data);
     int64_t timeUs = mStartTimeUs + (timestampUs - mFirstFrameTimeUs);
     mFrameTimes.push_back(timeUs);
@@ -898,26 +902,6 @@ void CameraSource::dataCallbackTimestamp(int64_t timestampUs,
 bool CameraSource::isMetaDataStoredInVideoBuffers() const {
     ALOGV("isMetaDataStoredInVideoBuffers");
     return mIsMetaDataStoredInVideoBuffers;
-}
-
-void CameraSource::adjustIncomingANWBuffer(IMemory* data) {
-    uint8_t *payload =
-            reinterpret_cast<uint8_t*>(data->pointer());
-    if (*(uint32_t*)payload == kMetadataBufferTypeGrallocSource) {
-        buffer_handle_t* pBuffer = (buffer_handle_t*)(payload + 4);
-        *pBuffer = (buffer_handle_t)((uint8_t*)(*pBuffer) +
-                ICameraRecordingProxy::getCommonBaseAddress());
-    }
-}
-
-void CameraSource::adjustOutgoingANWBuffer(IMemory* data) {
-    uint8_t *payload =
-            reinterpret_cast<uint8_t*>(data->pointer());
-    if (*(uint32_t*)payload == kMetadataBufferTypeGrallocSource) {
-        buffer_handle_t* pBuffer = (buffer_handle_t*)(payload + 4);
-        *pBuffer = (buffer_handle_t)((uint8_t*)(*pBuffer) -
-                ICameraRecordingProxy::getCommonBaseAddress());
-    }
 }
 
 CameraSource::ProxyListener::ProxyListener(const sp<CameraSource>& source) {
